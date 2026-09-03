@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-repo="aerfagogogo/qishui-audio-capture"
+repo="aerfagogogo/recorder"
 asset="Recorder-macOS.zip"
 download_url="${RECORDER_RELEASE_URL:-https://github.com/${repo}/releases/latest/download/${asset}}"
 
