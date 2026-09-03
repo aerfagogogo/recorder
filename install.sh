@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo="aerfagogogo/recorder"
 asset="Recorder-macOS.zip"
+expected_sha256="6a370acb9c4c8850c758dcbaece982434c1b15a00520049747659451e09a7350"
 download_url="${RECORDER_RELEASE_URL:-https://github.com/${repo}/releases/latest/download/${asset}}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -31,9 +32,12 @@ curl -fL --retry 5 \
   "$download_url" \
   -o "$work_dir/$asset"
 if [[ -z "${RECORDER_RELEASE_URL:-}" ]]; then
-  curl -fL --retry 5 --retry-all-errors \
-    "${download_url}.sha256" -o "$work_dir/${asset}.sha256"
-  (cd "$work_dir" && shasum -a 256 -c "${asset}.sha256")
+  actual_sha256="$(shasum -a 256 "$work_dir/$asset" | awk '{print $1}')"
+  if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+    echo "安装包校验失败，已停止安装。" >&2
+    exit 1
+  fi
+  echo "$asset: OK"
 fi
 ditto -x -k "$work_dir/$asset" "$work_dir/unpacked"
 
