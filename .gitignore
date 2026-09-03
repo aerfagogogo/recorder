@@ -1,0 +1,11 @@
+.build/
+.build-*/
+.swiftpm/
+Captures/
+dist/
+release/
+*.wav
+*.caf
+*.flac
+*.m4a
+.DS_Store
