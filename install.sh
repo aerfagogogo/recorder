@@ -26,11 +26,13 @@ cleanup() { rm -rf "$work_dir"; }
 trap cleanup EXIT
 
 echo "正在下载录音机…"
-curl -fL --retry 3 \
+curl -fL --retry 5 \
+  --retry-all-errors \
   "$download_url" \
   -o "$work_dir/$asset"
 if [[ -z "${RECORDER_RELEASE_URL:-}" ]]; then
-  curl -fL --retry 3 "${download_url}.sha256" -o "$work_dir/${asset}.sha256"
+  curl -fL --retry 5 --retry-all-errors \
+    "${download_url}.sha256" -o "$work_dir/${asset}.sha256"
   (cd "$work_dir" && shasum -a 256 -c "${asset}.sha256")
 fi
 ditto -x -k "$work_dir/$asset" "$work_dir/unpacked"
@@ -44,7 +46,11 @@ fi
 if ! command -v ffmpeg >/dev/null 2>&1; then
   if ! command -v brew >/dev/null 2>&1; then
     echo "需要 FFmpeg，正在安装 Homebrew…"
-    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    brew_installer="$work_dir/homebrew-install.sh"
+    curl -fL --retry 5 --retry-all-errors \
+      https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh \
+      -o "$brew_installer"
+    NONINTERACTIVE=1 /bin/bash "$brew_installer"
     if [[ -x /opt/homebrew/bin/brew ]]; then
       eval "$(/opt/homebrew/bin/brew shellenv)"
     elif [[ -x /usr/local/bin/brew ]]; then
