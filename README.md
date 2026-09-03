@@ -9,7 +9,7 @@
 适用于 macOS 15 或更新版本，同时支持 Apple 芯片和 Intel Mac：
 
 ```bash
-curl -fL --connect-timeout 15 --max-time 180 --retry 5 --retry-all-errors -o /tmp/recorder-install.sh https://github.com/aerfagogogo/recorder/releases/latest/download/install.sh && bash /tmp/recorder-install.sh
+curl -fL --connect-timeout 15 --max-time 180 --retry 5 --retry-all-errors -o /tmp/recorder-install.sh https://github.com/aerfagogogo/recorder/releases/latest/download/install-recorder.sh && bash /tmp/recorder-install.sh
 ```
 
 这条命令会先完整下载并校验安装脚本，只有下载成功才执行。安装程序会下载最新版本到“应用程序”，缺少 FFmpeg 时会通过 Homebrew 安装，并在完成后打开“录音机”。首次录音时，请按系统提示允许“系统音频录制”。
