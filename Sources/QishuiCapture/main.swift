@@ -38,6 +38,7 @@ private struct Options {
     var keepWAV = false
     var trimSilence = true
     var allowSilence = false
+    var mutePlayback = false
     var title: String?
     var artist: String?
     var album: String?
@@ -101,6 +102,8 @@ private struct Options {
                 options.audioSeconds = value
             case "--keep-wav":
                 options.keepWAV = true
+            case "--mute-playback":
+                options.mutePlayback = true
             case "--no-trim":
                 options.trimSilence = false
             case "--allow-silence":
@@ -179,6 +182,7 @@ private let usage = """
   --max-seconds <秒>        最长录制时间
   --audio-seconds <秒>      从检测到第一段声音起录满指定时长后停止
   --keep-wav                转换成功后仍保留临时无压缩 WAV
+  --mute-playback           只采集目标应用，不向扬声器输出；USR1/USR2 可切换
   --no-trim                 不自动裁掉录制首尾的数字静音
   --title <歌名>            写入 FLAC 歌名
   --artist <歌手>           写入 FLAC 歌手
@@ -471,7 +475,8 @@ private enum QishuiCapture {
             outputURL: urls.temporaryWAV,
             thresholdDB: options.thresholdDB,
             silenceSeconds: options.silenceSeconds,
-            audioSeconds: options.audioSeconds
+            audioSeconds: options.audioSeconds,
+            mutePlayback: options.mutePlayback
         )
 
         let stopSignal = AsyncStream<Void> { continuation in
@@ -482,13 +487,28 @@ private enum QishuiCapture {
             source.setEventHandler { continuation.yield() }
             source.resume()
 
+            signal(SIGUSR1, SIG_IGN)
+            signal(SIGUSR2, SIG_IGN)
+            let monitorQueue = DispatchQueue(label: "recorder.monitor-control")
+            let muteSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: monitorQueue)
+            let unmuteSource = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: monitorQueue)
+            for (control, muted) in [(muteSource, true), (unmuteSource, false)] {
+                control.setEventHandler {
+                    do { try recorder.setPlaybackMuted(muted) }
+                    catch { FileHandle.standardError.write(Data("\nMONITOR_ERROR=\(error.localizedDescription)\n".utf8)) }
+                }
+                control.resume()
+            }
+
             if let maximumSeconds = options.maximumSeconds {
                 DispatchQueue.global().asyncAfter(deadline: .now() + maximumSeconds) {
                     continuation.yield()
                 }
             }
 
-            continuation.onTermination = { _ in source.cancel() }
+            continuation.onTermination = { _ in
+                source.cancel(); muteSource.cancel(); unmuteSource.cancel()
+            }
         }
 
         print("目标应用：\(application.localizedName ?? bundleID)（bundle \(bundleID)）")
@@ -496,6 +516,7 @@ private enum QishuiCapture {
         print("现在播放歌曲；按 Control-C 停止。")
 
         try recorder.start()
+        try recorder.setPlaybackMuted(options.mutePlayback)
         FileHandle.standardOutput.write(Data("CAPTURE_READY\n".utf8))
         for await _ in stopSignal { break }
         let result = recorder.stop()

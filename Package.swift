@@ -21,6 +21,6 @@ let package = Package(
                 .linkedFramework("AppKit")
             ]
         ),
-        .executableTarget(name: "QishuiCaptureGUI")
+        .executableTarget(name: "QishuiCaptureGUI", swiftSettings: [.unsafeFlags(["-parse-as-library"])])
     ]
 )

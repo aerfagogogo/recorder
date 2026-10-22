@@ -149,7 +149,9 @@ final class ProcessTapRecorder: @unchecked Sendable {
     private let thresholdDB: Double
     private let silenceSeconds: Double
     private let audioSeconds: Double?
+    private let mutePlayback: Bool
     private let lock = NSLock()
+    private let controlLock = NSLock()
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
@@ -171,13 +173,15 @@ final class ProcessTapRecorder: @unchecked Sendable {
         outputURL: URL,
         thresholdDB: Double,
         silenceSeconds: Double,
-        audioSeconds: Double?
+        audioSeconds: Double?,
+        mutePlayback: Bool = false
     ) {
         self.targetBundleID = targetBundleID
         self.outputURL = outputURL
         self.thresholdDB = thresholdDB
         self.silenceSeconds = silenceSeconds
         self.audioSeconds = audioSeconds
+        self.mutePlayback = mutePlayback
     }
 
     func start() throws {
@@ -196,7 +200,7 @@ final class ProcessTapRecorder: @unchecked Sendable {
             description.name = "录音机 · \(targetBundleID)"
             description.processes = matchingProcesses
             description.isPrivate = true
-            description.muteBehavior = .unmuted
+            description.muteBehavior = mutePlayback ? .mutedWhenTapped : .unmuted
             description.isMixdown = true
             description.isMono = false
             if #available(macOS 26.0, *) {
@@ -287,6 +291,32 @@ final class ProcessTapRecorder: @unchecked Sendable {
             cleanup()
             throw error
         }
+    }
+
+    func setPlaybackMuted(_ muted: Bool) throws {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+        guard tapID != kAudioObjectUnknown else { return }
+        var address = propertyAddress(kAudioTapPropertyDescription)
+        var description: CATapDescription?
+        var size = UInt32(MemoryLayout<CATapDescription?>.size)
+        try requireNoError(withUnsafeMutablePointer(to: &description) {
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, $0)
+        }, "读取监听状态")
+        guard let current = description else { return }
+        current.muteBehavior = muted ? .mutedWhenTapped : .unmuted
+        try requireNoError(withUnsafePointer(to: &description) {
+            AudioObjectSetPropertyData(tapID, &address, 0, nil, size, $0)
+        }, "切换静音监听")
+        var verified: CATapDescription?
+        try requireNoError(withUnsafeMutablePointer(to: &verified) {
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, $0)
+        }, "核对监听状态")
+        let applied = verified?.muteBehavior == .mutedWhenTapped
+        guard applied == muted else {
+            throw NSError(domain: "RecorderMonitor", code: 1, userInfo: [NSLocalizedDescriptionKey: "系统未应用请求的监听状态"])
+        }
+        FileHandle.standardError.write(Data("\nMONITOR_MUTED=\(applied ? 1 : 0)\n".utf8))
     }
 
     fileprivate func consume(_ inputData: UnsafePointer<AudioBufferList>) -> OSStatus {
@@ -405,6 +435,8 @@ final class ProcessTapRecorder: @unchecked Sendable {
     }
 
     private func destroyAudioObjects() {
+        controlLock.lock()
+        defer { controlLock.unlock() }
         if aggregateDeviceID != kAudioObjectUnknown {
             AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
             aggregateDeviceID = kAudioObjectUnknown

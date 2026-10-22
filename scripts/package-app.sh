@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_dir="${0:A:h:h}"
-app_dir="$project_dir/dist/录音机.app"
+app_dir="${RECORDER_APP_DIR:-$project_dir/dist/录音机.app}"
 contents_dir="$app_dir/Contents"
 helper_dir="$contents_dir/Helpers/录音核心.app"
 helper_contents="$helper_dir/Contents"

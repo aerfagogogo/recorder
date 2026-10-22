@@ -142,6 +142,75 @@ private final class RecorderModel: ObservableObject {
     @Published var isFinishing = false
     @Published var status = "单曲模式会读取总时长并自动停止"
     @Published var levelDB = -160.0
+    @Published var mutePlayback = false
+    @Published var monitorStatus = "只屏蔽所选播放器的外放，不改变录音音量"
+    @Published var monitorPending = false
+    @Published var captureReady = false
+    @Published var signalWarning = ""
+    private var lowSignalSince: Date?
+    private var monitorBuffer = ""
+
+    func changeMonitoring() {
+        guard let process, process.isRunning, isRecording else { return }
+        monitorPending = true
+        monitorStatus = "正在切换监听…"
+        if kill(process.processIdentifier, mutePlayback ? SIGUSR1 : SIGUSR2) != 0 {
+            monitorPending = false
+            monitorStatus = "监听切换失败，录音未停止"
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, self.monitorPending else { return }
+            self.monitorPending = false
+            self.monitorStatus = "未收到监听切换确认，请重试；录音继续"
+        }
+    }
+
+    private func receiveMonitorStatus(_ text: String) {
+        monitorBuffer += text
+        while let end = monitorBuffer.firstIndex(of: "\n") {
+            let line = String(monitorBuffer[..<end])
+            monitorBuffer.removeSubrange(...end)
+            if line.contains("MONITOR_MUTED=") {
+                monitorPending = false
+                monitorStatus = line.contains("MONITOR_MUTED=1")
+                    ? "静音监听已生效 · 目标应用仍被采集" : "正常监听已恢复 · 录音继续"
+            } else if line.contains("MONITOR_ERROR=") {
+                monitorPending = false
+                monitorStatus = "监听切换失败，录音继续；请勿静音播放器本身"
+            }
+        }
+        if monitorBuffer.count > 4096 { monitorBuffer = String(monitorBuffer.suffix(2048)) }
+    }
+    @Published var shortLUFS: Double?
+    @Published var integratedLUFS: Double?
+    @Published var loudnessStatus = "等待录制 · 前 3 秒积累响度数据"
+    private let loudness = LiveLoudness()
+    private var loudnessFile: URL?
+    private var loudnessStart: Double?
+    private var loudnessGeneration = UUID()
+
+    private func updateLoudnessTrack() {
+        guard isRecording, let segment = trackSegments.last, let file = loudnessFile,
+              loudnessStart != segment.start else { return }
+        loudnessStart = segment.start
+        loudnessGeneration = UUID()
+        let token = loudnessGeneration
+        shortLUFS = nil; integratedLUFS = nil
+        loudnessStatus = "前 3 秒积累数据 · 累计值为录制中估算"
+        guard let ffmpeg = ffmpegURL() else {
+            loudnessStatus = "缺少 FFmpeg，响度分析不可用"
+            return
+        }
+        loudness.start(file: file, from: segment.start, ffmpeg: ffmpeg) { [weak self] short, integrated, message in
+            Task { @MainActor [weak self] in
+                guard let self, self.isRecording, self.loudnessGeneration == token else { return }
+                self.shortLUFS = short
+                self.integratedLUFS = integrated
+                self.loudnessStatus = message
+            }
+        }
+    }
     @Published var lastOutput: URL?
     @Published var conversionInput = ""
     @Published var conversionFormat: ExportFormat = .wav
@@ -170,7 +239,12 @@ private final class RecorderModel: ObservableObject {
     private var heardAudioSinceStart = false
     private var userCancelledBeforeAudio = false
     private var cachedNowPlaying: SystemNowPlayingInfo?
+    private var nowPlayingReceivedAt = Date.distantPast
+    @Published var isReadingTrack = false
+    private var trackReadID = UUID()
     private var nowPlayingAgent: Process?
+    private var nowPlayingAgentTarget: String?
+    private var nowPlayingAgentID = UUID()
     private var nowPlayingPipe: Pipe?
     private var nowPlayingBuffer = Data()
     private var activeMode: RecordingMode = .manual
@@ -308,21 +382,48 @@ private final class RecorderModel: ObservableObject {
     }
 
     func readCurrentTrack() {
+        guard !isRecording, !isFinishing, !isReadingTrack else { return }
         guard let player = NSWorkspace.shared.runningApplications.first(where: {
             $0.bundleIdentifier == targetApp
         }) else {
             status = "没有找到所选播放器"
             return
         }
+        let requestID = UUID()
+        trackReadID = requestID
+        let requestedAt = Date()
+        let selectedApp = targetApp
+        isReadingTrack = true
+        status = "正在读取当前歌曲…"
         startNowPlayingAgent()
-        guard let nowPlaying = cachedNowPlaying else {
-            status = "正在连接系统播放信息，请稍候再点一次"
-            return
+        Task { @MainActor [weak self] in
+            for _ in 0..<60 {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, self.trackReadID == requestID else { return }
+                guard !self.isRecording, !self.isFinishing, self.targetApp == selectedApp else {
+                    self.isReadingTrack = false
+                    return
+                }
+                if self.nowPlayingReceivedAt >= requestedAt,
+                   let info = self.cachedNowPlaying,
+                   info.processIdentifier == player.processIdentifier {
+                    self.isReadingTrack = false
+                    self.applyTrackPreview(info)
+                    return
+                }
+                if self.nowPlayingAgent?.isRunning != true {
+                    self.isReadingTrack = false
+                    self.status = "歌曲信息助手未能运行，请检查本机 Swift 运行环境"
+                    return
+                }
+            }
+            guard let self, self.trackReadID == requestID else { return }
+            self.isReadingTrack = false
+            self.status = "未收到所选播放器的歌曲信息；请确认它正在播放后重试"
         }
-        guard nowPlaying.processIdentifier == player.processIdentifier else {
-            status = "系统当前媒体来自其他应用；请在所选播放器中播放一次"
-            return
-        }
+    }
+
+    private func applyTrackPreview(_ nowPlaying: SystemNowPlayingInfo) {
         let track = nowPlaying.track
         title = track.title
         artist = track.artist
@@ -334,6 +435,8 @@ private final class RecorderModel: ObservableObject {
 
     func start() {
         guard !isRecording, !isFinishing else { return }
+        trackReadID = UUID()
+        isReadingTrack = false
         guard requestRequiredPermissions() else {
             waitForPermissionCompletion()
             return
@@ -393,6 +496,7 @@ private final class RecorderModel: ObservableObject {
             "--album", album
         ]
         if activeMode != .manual { captureArguments.append("--no-trim") }
+        if mutePlayback { captureArguments.append("--mute-playback") }
         task.arguments = captureArguments
         task.standardOutput = outPipe
         task.standardError = errPipe
@@ -405,6 +509,7 @@ private final class RecorderModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.isRecording else { return }
                 self.recordingStartedAt = Date()
+                self.captureReady = true
                 self.status = self.activeMode == .single
                     ? "已就绪，等待你从歌曲开头播放…"
                     : "连续录制已就绪，等待播放…"
@@ -417,8 +522,18 @@ private final class RecorderModel: ObservableObject {
             let parsedLevel = Self.lastDBFS(in: text)
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.receiveMonitorStatus(text)
                 if let parsedLevel {
                     self.levelDB = parsedLevel
+                    if parsedLevel <= -80, self.heardAudioSinceStart, (self.cachedNowPlaying?.playbackRate ?? 0) > 0 {
+                        if self.lowSignalSince == nil { self.lowSignalSince = Date() }
+                        if Date().timeIntervalSince(self.lowSignalSince!) >= 3 {
+                            self.signalWarning = "播放中持续无声：请检查播放器是否静音。也可能是歌曲本身的安静段。"
+                        }
+                    } else {
+                        self.lowSignalSince = nil
+                        self.signalWarning = ""
+                    }
                     if parsedLevel > -70, !self.heardAudioSinceStart {
                         self.heardAudioSinceStart = true
                         if self.trackSegments.isEmpty {
@@ -444,6 +559,17 @@ private final class RecorderModel: ObservableObject {
             stdoutPipe = outPipe
             stderrPipe = errPipe
             lastOutput = nil
+            loudness.stop()
+            captureReady = false
+            lowSignalSince = nil
+            signalWarning = ""
+            monitorBuffer = ""
+            monitorPending = false
+            monitorStatus = mutePlayback ? "静音监听开启 · 请保持播放器自身音量正常" : "正常监听 · 可随时开启静音监听"
+            loudnessFile = captureOutput.deletingPathExtension().appendingPathExtension("capture.wav")
+            loudnessStart = nil
+            shortLUFS = nil; integratedLUFS = nil
+            loudnessStatus = "等待识别本首起点 · 电平条随声音变化"
             levelDB = -160
             recorderErrorText = ""
             isRecording = true
@@ -518,6 +644,14 @@ private final class RecorderModel: ObservableObject {
     }
 
     private func didFinish(exitCode: Int32, output: URL) {
+        captureReady = false
+        lowSignalSince = nil
+        signalWarning = ""
+        monitorPending = false
+        monitorStatus = "录制已结束，目标应用外放已恢复"
+        loudness.stop()
+        loudnessGeneration = UUID()
+        loudnessStatus = "录制已结束 · 以上为实时估算，成品需另行复核"
         stopTrackMonitoring()
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
@@ -561,24 +695,34 @@ private final class RecorderModel: ObservableObject {
             $0.bundleIdentifier == targetApp
         }),
         let nowPlaying = cachedNowPlaying,
+        Date().timeIntervalSince(nowPlayingReceivedAt) < 2,
         nowPlaying.processIdentifier == player.processIdentifier else { return nil }
         return nowPlaying.track
     }
 
     private func refreshSystemNowPlaying() {
-        if nowPlayingAgent?.isRunning != true { startNowPlayingAgent() }
+        startNowPlayingAgent()
     }
 
     private func startNowPlayingAgent() {
-        guard nowPlayingAgent?.isRunning != true else { return }
+        guard nowPlayingAgent?.isRunning != true || nowPlayingAgentTarget != targetApp else { return }
+        if nowPlayingAgent?.isRunning == true { nowPlayingAgent?.terminate() }
+        nowPlayingAgentTarget = targetApp
+        nowPlayingAgentID = UUID()
+        cachedNowPlaying = nil
+        nowPlayingReceivedAt = .distantPast
         let bundledExecutable = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Helpers/now-playing-agent")
         let bundled = Bundle.main.resourceURL?.appendingPathComponent("NowPlayingAgent.swift")
         let development = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("AppBundle/NowPlayingAgent.swift")
-        if FileManager.default.isExecutableFile(atPath: bundledExecutable.path) {
+        // On this macOS installation the compiled helper receives no MediaRemote
+        // results. Prefer the verified Swift-hosted route when its source exists.
+        if ![bundled, development].compactMap({ $0 }).contains(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }), FileManager.default.isExecutableFile(atPath: bundledExecutable.path) {
             launchNowPlayingAgent(executable: bundledExecutable, arguments: [
-                String(ProcessInfo.processInfo.processIdentifier)
+                String(ProcessInfo.processInfo.processIdentifier), targetApp
             ])
             return
         }
@@ -591,7 +735,7 @@ private final class RecorderModel: ObservableObject {
 
         launchNowPlayingAgent(
             executable: URL(fileURLWithPath: "/usr/bin/swift"),
-            arguments: [script.path, String(ProcessInfo.processInfo.processIdentifier)]
+            arguments: [script.path, String(ProcessInfo.processInfo.processIdentifier), targetApp]
         )
     }
 
@@ -600,6 +744,7 @@ private final class RecorderModel: ObservableObject {
         nowPlayingBuffer.removeAll(keepingCapacity: true)
         let task = Process()
         let pipe = Pipe()
+        let agentID = nowPlayingAgentID
         task.executableURL = executable
         task.arguments = arguments
         task.standardOutput = pipe
@@ -608,6 +753,7 @@ private final class RecorderModel: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty else { return }
             Task { @MainActor [weak self] in
+                guard self?.nowPlayingAgentID == agentID else { return }
                 self?.consumeNowPlayingData(data)
             }
         }
@@ -644,6 +790,7 @@ private final class RecorderModel: ObservableObject {
                 ),
                 playbackRate: message.playbackRate
             )
+            nowPlayingReceivedAt = Date()
         }
     }
 
@@ -653,6 +800,7 @@ private final class RecorderModel: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.refreshSystemNowPlaying()
                 self?.pollCurrentTrack()
+                self?.updateLoudnessTrack()
             }
         }
         refreshSystemNowPlaying()
@@ -676,6 +824,14 @@ private final class RecorderModel: ObservableObject {
             guard !trackSegments.isEmpty else { return }
             if missingTrackSince == nil { missingTrackSince = now }
             if let missingTrackSince, now.timeIntervalSince(missingTrackSince) >= 3 {
+                if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == targetApp }) {
+                    // Metadata loss is not an audio stop. Keep the selected tap
+                    // (and its mute) alive; never extrapolate an unverified end.
+                    currentTrackStartedNearBeginning = false
+                    lastProgressAdvanceAt = nil
+                    status = "歌曲信息暂不可用，仍在采集所选播放器；当前片段需重新确认完整起点"
+                    return
+                }
                 if activeMode == .single {
                     discardUnfinishedTail = true
                 } else {
@@ -1353,11 +1509,21 @@ private struct RecorderView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Toggle("置顶并显示在所有桌面", isOn: $keepWindowVisible)
-                .toggleStyle(.switch)
-                .onChange(of: keepWindowVisible) { _, enabled in
-                    configureWindow(enabled)
-                }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Toggle("所有桌面置顶", isOn: $keepWindowVisible)
+                        .toggleStyle(.switch)
+                        .onChange(of: keepWindowVisible) { _, enabled in configureWindow(enabled) }
+                    Spacer(minLength: 30)
+                    Toggle("静音监听 · 仍然录音", isOn: $model.mutePlayback)
+                        .toggleStyle(.switch)
+                        .disabled(model.isFinishing || model.monitorPending || (model.isRecording && !model.captureReady))
+                        .onChange(of: model.mutePlayback) { _, _ in model.changeMonitoring() }
+                }.padding(.bottom, 6)
+                Text(model.monitorStatus).font(.caption).foregroundStyle(.secondary)
+                Text("不要点播放器自己的静音或把它的音量调到零。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
 
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
                 GridRow {
@@ -1371,7 +1537,8 @@ private struct RecorderView: View {
                         }
                         .labelsHidden()
                         Button("刷新") { model.refreshPlayers() }
-                        Button("读取当前歌曲") { model.readCurrentTrack() }
+                        Button(model.isReadingTrack ? "正在读取…" : "读取当前歌曲") { model.readCurrentTrack() }
+                            .disabled(model.isReadingTrack || model.isRecording || model.isFinishing)
                     }
                 }
                 GridRow {
@@ -1426,18 +1593,41 @@ private struct RecorderView: View {
 
             VStack(spacing: 8) {
                 ProgressView(value: model.levelProgress)
-                    .tint(model.levelDB > -60 ? .green : .gray)
+                    .tint(model.levelDB > -6 ? .orange : model.levelDB > -60 ? .green : .gray)
+                    .animation(.linear(duration: 0.2), value: model.levelProgress)
+                HStack {
+                    Text("音频电平")
+                    Spacer()
+                    Text(model.isRecording ? String(format: "%.1f dBFS", model.levelDB) : "— dBFS")
+                        .monospacedDigit()
+                }.font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 24) {
+                    loudnessValue("当前 · 近 3 秒", model.shortLUFS)
+                    loudnessValue("本首累计 · 估算", model.integratedLUFS)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("成品参考").font(.caption).foregroundStyle(.secondary)
+                        Text("−14 LUFS").font(.headline.monospacedDigit())
+                    }
+                    Spacer()
+                }
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.15))
+                        Capsule().fill(Color.green).frame(width: geometry.size.width * max(0, min(1, ((model.shortLUFS ?? -40) + 40) / 40)))
+                        Rectangle().fill(Color.primary).frame(width: 2).offset(x: geometry.size.width * 0.65)
+                    }
+                }.frame(height: 8)
+                Text(model.loudnessStatus + " · 参考线不代表已自动调音")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !model.signalWarning.isEmpty {
+                    Text(model.signalWarning).font(.caption).foregroundStyle(.orange)
+                }
                 HStack {
                     Text(model.status)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                     Spacer()
-                    if model.isRecording {
-                        Text(String(format: "%.1f dBFS", model.levelDB))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(model.levelDB > -60 ? .green : .secondary)
-                    }
                 }
             }
 
@@ -1520,6 +1710,14 @@ private struct RecorderView: View {
                 try? await Task.sleep(for: .milliseconds(250))
                 configureWindow(keepWindowVisible)
             }
+        }
+    }
+
+    private func loudnessValue(_ label: String, _ value: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text(value.map { String(format: "%.1f LUFS", $0) } ?? "— LUFS")
+                .font(.headline.monospacedDigit())
         }
     }
 
