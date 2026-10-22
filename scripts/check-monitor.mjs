@@ -33,11 +33,13 @@ try {
   await sleep(3000);
   assert(err.includes('MONITOR_MUTED=1'), `No mute acknowledgement: ${err}`);
   capture.kill('SIGUSR2');
-  await sleep(2000);
+  // Leave a buffer beyond the 7-second measurement window for audio callbacks.
+  await sleep(2500);
   assert(err.split('MONITOR_MUTED=0').length>=3, `No unmute acknowledgement: ${err}`);
   capture.kill('SIGINT');
   assert.equal(await ended,0,err);
   const pcm=execFileSync(ffmpeg,['-v','error','-i',output,'-f','f32le','-ac','1','-ar','48000','pipe:1'], {maxBuffer:8*1024*1024});
+  assert(pcm.length >= 7*48000*4, `Recording too short: ${pcm.length/(48000*4)} seconds`);
   const rms=(start,end)=>{let sum=0,n=0;for(let i=start*48000*4;i<end*48000*4;i+=4){const x=pcm.readFloatLE(i);sum+=x*x;n++}return 20*Math.log10(Math.sqrt(sum/n));};
   const normal=rms(1,2), muted=rms(3,4), restored=rms(6,7);
   assert(normal > -50 && Math.abs(normal-muted)<0.2 && Math.abs(normal-restored)<0.2, JSON.stringify({normal,muted,restored}));
